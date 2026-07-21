@@ -37,6 +37,10 @@ struct Args {
     #[arg(short = 'y', long)]
     overwrite: bool,
 
+    /// Move each source video to the trash after its frame is successfully extracted
+    #[arg(short = 'd', long)]
+    delete_source: bool,
+
     /// Print the ffmpeg commands without running them
     #[arg(short = 'n', long)]
     dry_run: bool,
@@ -121,7 +125,19 @@ fn main() {
         }
 
         match run_ffmpeg(&path, &output, &args) {
-            Ok(true) => processed += 1,
+            Ok(true) => {
+                processed += 1;
+                if args.delete_source {
+                    match trash::delete(&path) {
+                        Ok(()) => {
+                            if !args.quiet {
+                                println!("trashed {}", path.display());
+                            }
+                        }
+                        Err(e) => eprintln!("failed to trash {}: {e}", path.display()),
+                    }
+                }
+            }
             Ok(false) => {
                 failed += 1;
                 eprintln!("ffmpeg failed for {}", path.display());
