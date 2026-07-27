@@ -26,7 +26,7 @@ struct Args {
     extensions: Vec<String>,
 
     /// Image format / extension for the extracted frames
-    #[arg(short, long, default_value = "png")]
+    #[arg(short, long, default_value = "jpg")]
     format: String,
 
     /// Seek to this timestamp before grabbing the frame (e.g. 5, 0:30, 00:01:15)
@@ -178,6 +178,19 @@ fn build_command(input: &Path, output: &Path, args: &Args) -> Command {
 
     cmd.arg("-i").arg(input);
     cmd.args(["-frames:v", "1"]);
+
+    // JPEG is much smaller than PNG while retaining near-maximal visual quality.
+    // FFmpeg's MJPEG quality scale runs from 2 (best) to 31 (worst).
+    if matches!(
+        args.format
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "jpg" | "jpeg"
+    ) {
+        cmd.args(["-q:v", "2"]);
+    }
+
     cmd.arg(output);
     cmd
 }
