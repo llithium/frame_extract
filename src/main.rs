@@ -31,9 +31,18 @@ struct Args {
     #[arg(short, long, default_value = "jpg")]
     format: String,
 
-    /// Seek to this timestamp before grabbing the frame (e.g. 5, 0:30, 00:01:15)
+    /// Where to grab the frame: a timestamp (5, 0:30, 00:01:15) or a
+    /// percentage of each video's length (50%)
+    #[arg(short, long, value_parser = parse_seek)]
+    seek: Option<Seek>,
+
+    /// JPEG quality from 2 (best, largest) to 31 (worst, smallest)
+    #[arg(short = 'Q', long, value_parser = clap::value_parser!(u8).range(2..=31))]
+    quality: Option<u8>,
+
+    /// Also scan subdirectories, mirroring their layout in the output directory
     #[arg(short, long)]
-    seek: Option<String>,
+    recursive: bool,
 
     /// Overwrite existing frame files instead of skipping them
     #[arg(short = 'y', long)]
@@ -52,6 +61,35 @@ struct Args {
     quiet: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum Seek {
+    /// A timestamp passed to ffmpeg as-is.
+    Time(String),
+    /// A percentage of the video's duration, in [0, 100).
+    Percent(f64),
+}
+
+fn parse_seek(s: &str) -> Result<Seek, String> {
+    let s = s.trim();
+    let Some(pct) = s.strip_suffix('%') else {
+        if s.is_empty() {
+            return Err("seek position must not be empty".into());
+        }
+        return Ok(Seek::Time(s.to_string()));
+    };
+    let pct: f64 = pct
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid percentage: {s}"))?;
+    // 100% is the very end of the video, where there is no frame to grab.
+    if !(0.0..100.0).contains(&pct) {
+        return Err("percentage must be at least 0% and less than 100%".into());
+    }
+    Ok(Seek::Percent(pct))
+}
+
+const DEFAULT_JPEG_QUALITY: u8 = 2;
+
 fn main() {
     let mut args = Args::parse();
 
@@ -59,6 +97,9 @@ fn main() {
     args.format = normalize_ext(&args.format);
     if args.format.is_empty() {
         fail("--format must not be empty");
+    }
+    if args.quality.is_some() && !is_jpeg(&args.format) {
+        fail("--quality only applies to the jpg/jpeg format");
     }
 
     let extensions: Vec<String> = args
@@ -68,8 +109,12 @@ fn main() {
         .filter(|e| !e.is_empty())
         .collect();
 
+    // Percentage seeks need ffprobe to read durations, even for a dry run.
+    if matches!(args.seek, Some(Seek::Percent(_))) && !tool_available("ffprobe") {
+        fail("ffprobe was not found on PATH (needed for a percentage --seek)");
+    }
     if !args.dry_run {
-        if !ffmpeg_available() {
+        if !tool_available("ffmpeg") {
             fail("ffmpeg was not found on PATH");
         }
         if let Err(e) = fs::create_dir_all(&args.output) {
@@ -80,7 +125,7 @@ fn main() {
         }
     }
 
-    let videos = match find_videos(&args.input, &extensions) {
+    let videos = match find_videos(&args.input, &extensions, args.recursive, &args.output) {
         Ok(v) => v,
         Err(e) => fail(&format!(
             "failed to read input directory {}: {e}",
@@ -94,7 +139,7 @@ fn main() {
     let mut claimed: HashSet<PathBuf> = HashSet::new();
 
     for path in videos {
-        let output = output_path(&path, &args.output, &args.format);
+        let output = output_path(&path, &args.input, &args.output, &args.format);
 
         // Two videos with the same stem (clip.mp4, clip.mkv) would write the
         // same frame file. Refuse the second rather than silently skipping it
@@ -117,12 +162,21 @@ fn main() {
             continue;
         }
 
+        let seek = match resolve_seek(&path, args.seek.as_ref()) {
+            Ok(s) => s,
+            Err(msg) => {
+                failed += 1;
+                eprintln!("error: {}: {msg}", path.display());
+                continue;
+            }
+        };
+
         if args.dry_run {
-            println!("{}", describe(&path, &output, &args));
+            println!("{}", describe(&path, &output, seek.as_deref(), &args));
             continue;
         }
 
-        if let Err(msg) = extract(&path, &output, &args) {
+        if let Err(msg) = extract(&path, &output, seek.as_deref(), &args) {
             failed += 1;
             eprintln!("error: {}: {msg}", path.display());
             continue;
@@ -162,31 +216,105 @@ fn normalize_ext(ext: &str) -> String {
     ext.trim().trim_start_matches('.').to_lowercase()
 }
 
-/// Video files directly inside `dir`, sorted by name for a predictable order.
-fn find_videos(dir: &Path, extensions: &[String]) -> std::io::Result<Vec<PathBuf>> {
-    let mut videos: Vec<PathBuf> = fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.extension()
-                .map(|e| extensions.contains(&e.to_string_lossy().to_lowercase()))
-                .unwrap_or(false)
-        })
-        .collect();
+fn is_jpeg(format: &str) -> bool {
+    matches!(format, "jpg" | "jpeg")
+}
+
+fn has_extension(path: &Path, extensions: &[String]) -> bool {
+    path.extension()
+        .map(|e| extensions.contains(&e.to_string_lossy().to_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Video files inside `root` (and its subdirectories when `recursive`),
+/// sorted by path for a predictable order. Directory symlinks are not
+/// followed, and `out_dir` is never scanned.
+fn find_videos(
+    root: &Path,
+    extensions: &[String],
+    recursive: bool,
+    out_dir: &Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    let out_dir = fs::canonicalize(out_dir).ok();
+    let mut videos = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    let mut is_root = true;
+
+    while let Some(dir) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Only an unreadable top-level directory is fatal.
+            Err(e) if is_root => return Err(e),
+            Err(e) => {
+                eprintln!("warning: skipping {}: {e}", dir.display());
+                continue;
+            }
+        };
+        is_root = false;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // file_type() does not follow symlinks, which avoids loops.
+            let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_real_dir {
+                if recursive && fs::canonicalize(&path).ok() != out_dir {
+                    dirs.push(path);
+                }
+            } else if path.is_file() && has_extension(&path, extensions) {
+                videos.push(path);
+            }
+        }
+    }
+
     videos.sort();
     Ok(videos)
 }
 
-fn output_path(video: &Path, out_dir: &Path, format: &str) -> PathBuf {
+/// The frame file for `video`: its stem plus `format`, placed under `out_dir`
+/// at the same relative location the video has under `in_dir`.
+fn output_path(video: &Path, in_dir: &Path, out_dir: &Path, format: &str) -> PathBuf {
+    let relative_dir = video
+        .parent()
+        .and_then(|p| p.strip_prefix(in_dir).ok())
+        .unwrap_or(Path::new(""));
     // Work with OsString so file names that aren't valid UTF-8 still work.
     let mut name: OsString = video.file_stem().unwrap_or_default().to_owned();
     name.push(".");
     name.push(format);
-    out_dir.join(name)
+    out_dir.join(relative_dir).join(name)
 }
 
-fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
+/// Turn the --seek option into the value passed to ffmpeg's -ss.
+fn resolve_seek(video: &Path, seek: Option<&Seek>) -> Result<Option<String>, String> {
+    match seek {
+        None => Ok(None),
+        Some(Seek::Time(t)) => Ok(Some(t.clone())),
+        Some(Seek::Percent(pct)) => {
+            let duration = probe_duration(video)?;
+            Ok(Some(format!("{:.3}", duration * pct / 100.0)))
+        }
+    }
+}
+
+/// The video's duration in seconds, read with ffprobe.
+fn probe_duration(video: &Path) -> Result<f64, String> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(video)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run ffprobe: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match text.trim().parse::<f64>() {
+        Ok(d) if out.status.success() && d.is_finite() && d > 0.0 => Ok(d),
+        _ => Err("could not read the video's duration".into()),
+    }
+}
+
+fn tool_available(program: &str) -> bool {
+    Command::new(program)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -197,8 +325,12 @@ fn ffmpeg_available() -> bool {
 }
 
 /// Run ffmpeg and confirm a frame was actually written.
-fn extract(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
-    let status = build_command(input, output, args)
+fn extract(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> Result<(), String> {
+    if let Some(dir) = output.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    }
+
+    let status = build_command(input, output, seek, args)
         .stdin(Stdio::null())
         .status()
         .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
@@ -221,7 +353,7 @@ fn extract(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn build_command(input: &Path, output: &Path, args: &Args) -> Command {
+fn build_command(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> Command {
     let mut cmd = Command::new("ffmpeg");
 
     // Don't let ffmpeg read keystrokes from the terminal.
@@ -233,7 +365,7 @@ fn build_command(input: &Path, output: &Path, args: &Args) -> Command {
     }
 
     // Seeking before -i is fast (keyframe seek).
-    if let Some(seek) = &args.seek {
+    if let Some(seek) = seek {
         cmd.arg("-ss").arg(seek);
     }
 
@@ -244,8 +376,9 @@ fn build_command(input: &Path, output: &Path, args: &Args) -> Command {
 
     // JPEG is much smaller than PNG while retaining near-maximal visual quality.
     // FFmpeg's MJPEG quality scale runs from 2 (best) to 31 (worst).
-    if matches!(args.format.as_str(), "jpg" | "jpeg") {
-        cmd.args(["-q:v", "2"]);
+    if is_jpeg(&args.format) {
+        let quality = args.quality.unwrap_or(DEFAULT_JPEG_QUALITY);
+        cmd.arg("-q:v").arg(quality.to_string());
     }
 
     cmd.arg(output);
@@ -253,8 +386,8 @@ fn build_command(input: &Path, output: &Path, args: &Args) -> Command {
 }
 
 /// The ffmpeg command as a line that can be pasted into a POSIX shell.
-fn describe(input: &Path, output: &Path, args: &Args) -> String {
-    let cmd = build_command(input, output, args);
+fn describe(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> String {
+    let cmd = build_command(input, output, seek, args);
     std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
         .map(|a| shell_quote(&a.to_string_lossy()))
@@ -285,8 +418,35 @@ mod tests {
 
     #[test]
     fn output_path_uses_stem_and_format() {
-        let p = output_path(Path::new("in/my clip.mkv"), Path::new("out"), "jpg");
+        let p = output_path(
+            Path::new("in/my clip.mkv"),
+            Path::new("in"),
+            Path::new("out"),
+            "jpg",
+        );
         assert_eq!(p, Path::new("out/my clip.jpg"));
+    }
+
+    #[test]
+    fn output_path_mirrors_subdirectories() {
+        let p = output_path(
+            Path::new("in/a/b/clip.mp4"),
+            Path::new("in"),
+            Path::new("out"),
+            "png",
+        );
+        assert_eq!(p, Path::new("out/a/b/clip.png"));
+    }
+
+    #[test]
+    fn parses_seek_values() {
+        assert_eq!(parse_seek("0:30"), Ok(Seek::Time("0:30".into())));
+        assert_eq!(parse_seek("50%"), Ok(Seek::Percent(50.0)));
+        assert_eq!(parse_seek(" 12.5 % "), Ok(Seek::Percent(12.5)));
+        assert!(parse_seek("100%").is_err());
+        assert!(parse_seek("-5%").is_err());
+        assert!(parse_seek("abc%").is_err());
+        assert!(parse_seek("").is_err());
     }
 
     #[test]
