@@ -1,8 +1,12 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use clap::Parser;
 
@@ -36,6 +40,12 @@ struct Args {
     #[arg(short, long, value_parser = parse_seek)]
     seek: Option<Seek>,
 
+    /// With --seek, grab the keyframe at or before the seek point instead of
+    /// the exact frame. Much faster, but the frame can be a few seconds early
+    /// (past the end of a video, it is the last keyframe)
+    #[arg(short, long, requires = "seek")]
+    keyframe: bool,
+
     /// Image quality, on each encoder's own scale. jpg: 2-31, lower is better
     /// (default 2). webp: 0-100, higher is better (default 90). avif: 0-63,
     /// lower is better (default 10). The defaults look about the same.
@@ -54,11 +64,15 @@ struct Args {
     #[arg(short = 'd', long)]
     delete_source: bool,
 
+    /// Number of videos to process at once [default: number of CPU cores]
+    #[arg(short, long)]
+    jobs: Option<NonZeroUsize>,
+
     /// Print the ffmpeg commands without running them
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Suppress ffmpeg's own output
+    /// Only print errors
     #[arg(short, long)]
     quiet: bool,
 }
@@ -209,10 +223,10 @@ fn main() {
         )),
     };
 
-    let mut processed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut claimed: HashSet<PathBuf> = HashSet::new();
+    let mut jobs: Vec<Job> = Vec::new();
 
     for path in videos {
         let output = output_path(&path, &args.input, &args.output, &args.format);
@@ -238,49 +252,119 @@ fn main() {
             continue;
         }
 
-        let seek = match resolve_seek(&path, args.seek.as_ref()) {
-            Ok(s) => s,
-            Err(msg) => {
-                failed += 1;
-                eprintln!("error: {}: {msg}", path.display());
-                continue;
-            }
-        };
-
-        if args.dry_run {
-            println!("{}", describe(&path, &output, seek.as_deref(), &args));
-            continue;
-        }
-
-        if let Err(msg) = extract(&path, &output, seek.as_deref(), &args) {
-            failed += 1;
-            eprintln!("error: {}: {msg}", path.display());
-            continue;
-        }
-        processed += 1;
-
-        if args.delete_source {
-            match trash::delete(&path) {
-                Ok(()) => {
-                    if !args.quiet {
-                        println!("trashed {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("error: failed to trash {}: {e}", path.display());
-                }
-            }
-        }
+        jobs.push(Job {
+            video: path,
+            output,
+        });
     }
 
-    if !args.quiet && !args.dry_run {
+    if args.dry_run {
+        for job in &jobs {
+            match resolve_seek(&job.video, args.seek.as_ref()) {
+                Ok(seek) => println!(
+                    "{}",
+                    describe(&job.video, &job.output, seek.as_deref(), &args)
+                ),
+                Err(msg) => {
+                    failed += 1;
+                    eprintln!("error: {}: {msg}", job.video.display());
+                }
+            }
+        }
+        if failed > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let workers = args
+        .jobs
+        .or_else(|| thread::available_parallelism().ok())
+        .map_or(1, NonZeroUsize::get);
+
+    let total = jobs.len();
+    let mut processed = 0usize;
+    let mut done = 0usize;
+
+    run_parallel(&jobs, workers, &args, |job, result| {
+        done += 1;
+        match result {
+            Ok(()) => {
+                processed += 1;
+                if !args.quiet {
+                    println!(
+                        "[{done}/{total}] {} -> {}",
+                        job.video.display(),
+                        job.output.display()
+                    );
+                }
+                // Trashing happens here, on the main thread, one at a time.
+                if args.delete_source {
+                    match trash::delete(&job.video) {
+                        Ok(()) => {
+                            if !args.quiet {
+                                println!("trashed {}", job.video.display());
+                            }
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("error: failed to trash {}: {e}", job.video.display());
+                        }
+                    }
+                }
+            }
+            Err(msg) => {
+                failed += 1;
+                eprintln!("error: [{done}/{total}] {}: {msg}", job.video.display());
+            }
+        }
+    });
+
+    if !args.quiet {
         println!("done: {processed} extracted, {skipped} skipped, {failed} failed");
     }
 
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+/// One video to extract a frame from, and where to write it.
+struct Job {
+    video: PathBuf,
+    output: PathBuf,
+}
+
+/// Extract frames for `jobs` on `workers` threads, each running its own
+/// ffmpeg. `on_done` is called on the calling thread as each job finishes,
+/// in completion order, so it can print and trash without locking.
+fn run_parallel<F>(jobs: &[Job], workers: usize, args: &Args, mut on_done: F)
+where
+    F: FnMut(&Job, Result<(), String>),
+{
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for _ in 0..workers.min(jobs.len()) {
+            let tx = tx.clone();
+            let next = &next;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(i) else { break };
+                let result = resolve_seek(&job.video, args.seek.as_ref())
+                    .and_then(|seek| extract(&job.video, &job.output, seek.as_deref(), args));
+                if tx.send((i, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        // Drop the original sender so the loop below ends with the workers.
+        drop(tx);
+        for (i, result) in rx {
+            on_done(&jobs[i], result);
+        }
+    });
 }
 
 fn fail(msg: &str) -> ! {
@@ -402,10 +486,15 @@ fn extract(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> Resu
         fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
     }
 
-    let status = build_command(input, output, seek, args)
+    // Capture ffmpeg's messages instead of letting parallel runs interleave
+    // on the terminal; they are shown only when something goes wrong.
+    let result = build_command(input, output, seek, args)
         .stdin(Stdio::null())
-        .status()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    let status = result.status;
 
     let written = fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false);
 
@@ -415,7 +504,13 @@ fn extract(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> Resu
     }
 
     if !status.success() {
-        return Err(format!("ffmpeg exited with {status}"));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("ffmpeg exited with {status}")
+        } else {
+            format!("ffmpeg exited with {status}:\n{}", indent(detail))
+        });
     }
     if !written {
         // ffmpeg exits 0 without writing anything when, for example, the
@@ -432,16 +527,27 @@ fn build_command(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -
     cmd.arg("-nostdin");
     cmd.arg(if args.overwrite { "-y" } else { "-n" });
 
-    if args.quiet {
-        cmd.args(["-loglevel", "error"]);
-    }
+    // Errors only: output is captured and shown when a run fails.
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
 
-    // Seeking before -i is fast (keyframe seek).
+    // Seeking before -i jumps to the keyframe at or before the seek point.
+    // By default ffmpeg then decodes forward to the exact frame, which can
+    // mean hundreds of frames; -noaccurate_seek takes the keyframe itself.
     if let Some(seek) = seek {
+        if args.keyframe {
+            cmd.arg("-noaccurate_seek");
+        }
         cmd.arg("-ss").arg(seek);
     }
 
     cmd.arg("-i").arg(input);
+
+    // The keyframe is timestamped before the seek point. The image muxer's
+    // constant-frame-rate handling would drop frames until it reaches the
+    // seek point, decoding just as much as an exact seek, so pass it through.
+    if args.keyframe && seek.is_some() {
+        cmd.args(["-fps_mode", "passthrough"]);
+    }
 
     // -update 1 tells the image2 muxer this is a single image, not a sequence.
     cmd.args(["-frames:v", "1", "-update", "1"]);
@@ -465,6 +571,13 @@ fn describe(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -> Str
         .map(|a| shell_quote(&a.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn shell_quote(s: &str) -> String {
