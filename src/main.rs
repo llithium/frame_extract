@@ -36,8 +36,10 @@ struct Args {
     #[arg(short, long, value_parser = parse_seek)]
     seek: Option<Seek>,
 
-    /// JPEG quality from 2 (best, largest) to 31 (worst, smallest)
-    #[arg(short = 'Q', long, value_parser = clap::value_parser!(u8).range(2..=31))]
+    /// Image quality, on each encoder's own scale. jpg: 2-31, lower is better
+    /// (default 2). webp: 0-100, higher is better (default 90). avif: 0-63,
+    /// lower is better (default 10). The defaults look about the same.
+    #[arg(short = 'Q', long)]
     quality: Option<u8>,
 
     /// Also scan subdirectories, mirroring their layout in the output directory
@@ -88,7 +90,69 @@ fn parse_seek(s: &str) -> Result<Seek, String> {
     Ok(Seek::Percent(pct))
 }
 
-const DEFAULT_JPEG_QUALITY: u8 = 2;
+/// Lossy formats whose quality the tool sets, with each encoder's scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lossy {
+    /// ffmpeg's MJPEG encoder, -q:v 2 (best) to 31 (worst).
+    Jpeg,
+    /// libwebp, -quality 0 (worst) to 100 (best).
+    Webp,
+    /// libaom AV1, -crf 0 (best) to 63 (worst).
+    Avif,
+}
+
+impl Lossy {
+    fn from_format(format: &str) -> Option<Self> {
+        match format {
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            "webp" => Some(Self::Webp),
+            "avif" => Some(Self::Avif),
+            _ => None,
+        }
+    }
+
+    /// Defaults chosen to score about the same on SSIM, so switching format
+    /// changes the file size rather than how the frame looks.
+    fn default_quality(self) -> u8 {
+        match self {
+            Self::Jpeg => 2,
+            Self::Webp => 90,
+            Self::Avif => 10,
+        }
+    }
+
+    fn quality_range(self) -> (u8, u8, &'static str) {
+        match self {
+            Self::Jpeg => (2, 31, "lower is better"),
+            Self::Webp => (0, 100, "higher is better"),
+            Self::Avif => (0, 63, "lower is better"),
+        }
+    }
+
+    fn encoder_args(self, quality: u8) -> Vec<String> {
+        let q = quality.to_string();
+        let args: &[&str] = match self {
+            Self::Jpeg => &["-q:v", &q],
+            // Pin libwebp so the output is a still image, not an animation.
+            Self::Webp => &["-c:v", "libwebp", "-quality", &q, "-compression_level", "6"],
+            // libaom's default speed takes seconds per frame; cpu-used 6 is
+            // several times faster at a small cost in size.
+            Self::Avif => &[
+                "-c:v",
+                "libaom-av1",
+                "-crf",
+                &q,
+                "-cpu-used",
+                "6",
+                "-row-mt",
+                "1",
+                "-still-picture",
+                "1",
+            ],
+        };
+        args.iter().map(|a| a.to_string()).collect()
+    }
+}
 
 fn main() {
     let mut args = Args::parse();
@@ -98,8 +162,20 @@ fn main() {
     if args.format.is_empty() {
         fail("--format must not be empty");
     }
-    if args.quality.is_some() && !is_jpeg(&args.format) {
-        fail("--quality only applies to the jpg/jpeg format");
+    if let Some(quality) = args.quality {
+        let Some(lossy) = Lossy::from_format(&args.format) else {
+            fail(&format!(
+                "--quality does not apply to {}; use jpg, webp or avif",
+                args.format
+            ));
+        };
+        let (min, max, direction) = lossy.quality_range();
+        if !(min..=max).contains(&quality) {
+            fail(&format!(
+                "--quality for {} must be {min}-{max} ({direction})",
+                args.format
+            ));
+        }
     }
 
     let extensions: Vec<String> = args
@@ -214,10 +290,6 @@ fn fail(msg: &str) -> ! {
 
 fn normalize_ext(ext: &str) -> String {
     ext.trim().trim_start_matches('.').to_lowercase()
-}
-
-fn is_jpeg(format: &str) -> bool {
-    matches!(format, "jpg" | "jpeg")
 }
 
 fn has_extension(path: &Path, extensions: &[String]) -> bool {
@@ -374,11 +446,11 @@ fn build_command(input: &Path, output: &Path, seek: Option<&str>, args: &Args) -
     // -update 1 tells the image2 muxer this is a single image, not a sequence.
     cmd.args(["-frames:v", "1", "-update", "1"]);
 
-    // JPEG is much smaller than PNG while retaining near-maximal visual quality.
-    // FFmpeg's MJPEG quality scale runs from 2 (best) to 31 (worst).
-    if is_jpeg(&args.format) {
-        let quality = args.quality.unwrap_or(DEFAULT_JPEG_QUALITY);
-        cmd.arg("-q:v").arg(quality.to_string());
+    // Without explicit settings ffmpeg's defaults are much lower quality
+    // (WebP 75, AVIF CRF 32) than its JPEG output.
+    if let Some(lossy) = Lossy::from_format(&args.format) {
+        let quality = args.quality.unwrap_or(lossy.default_quality());
+        cmd.args(lossy.encoder_args(quality));
     }
 
     cmd.arg(output);
@@ -436,6 +508,16 @@ mod tests {
             "png",
         );
         assert_eq!(p, Path::new("out/a/b/clip.png"));
+    }
+
+    #[test]
+    fn quality_defaults_are_in_range() {
+        for lossy in [Lossy::Jpeg, Lossy::Webp, Lossy::Avif] {
+            let (min, max, _) = lossy.quality_range();
+            assert!((min..=max).contains(&lossy.default_quality()));
+        }
+        assert_eq!(Lossy::from_format("jpeg"), Some(Lossy::Jpeg));
+        assert_eq!(Lossy::from_format("png"), None);
     }
 
     #[test]
